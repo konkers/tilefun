@@ -1,0 +1,18 @@
+[package]
+name = "game"
+version = "0.1.0"
+authors = []
+edition = "2018"
+
+[dependencies]
+amethyst = "0.13.2"
+serde = "1.0.103"
+tiled_support = { path = "../amethyst-tiled" }
+
+[features]
+default = ["metal", "profiler"]
+empty = ["amethyst/empty"]
+metal = ["amethyst/metal"]
+vulkan = ["amethyst/vulkan"]
+profiler = ["amethyst/profiler"]
+

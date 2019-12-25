@@ -7,11 +7,18 @@ use amethyst::{
         AssetStorage, Handle, Loader, PrefabData, PrefabLoader, PrefabLoaderSystemDesc,
         ProgressCounter, RonFormat,
     },
-    core::{math::Vector3, Transform, TransformBundle},
+    core::{
+        geometry::Plane,
+        math::{Point2, Point3, Vector2, Vector3},
+        Transform, TransformBundle,
+    },
     derive::PrefabData,
-    ecs::{prelude::Entity, Entities, Join, Read, ReadStorage, System, WriteStorage},
+    ecs::{
+        prelude::Entity, BitSet, Entities, Join, Read, ReadExpect, ReadStorage, System, SystemData,
+        World, Write, WriteStorage,
+    },
     error::Error,
-    input::{InputBundle, InputHandler, StringBindings},
+    input::{is_close_requested, is_key_down, InputBundle, InputHandler, StringBindings},
     prelude::*,
     renderer::{
         camera::{ActiveCamera, Camera},
@@ -21,13 +28,20 @@ use amethyst::{
         types::DefaultBackend,
         RenderingBundle, Texture,
     },
-    tiles::{FlatEncoder, RenderTiles2D},
+    tiles::{
+        iters::Region, CoordinateEncoder, DrawTiles2DBounds, FlatEncoder, Map, RenderTiles2D, Tile,
+        TileMap,
+    },
     utils::application_root_dir,
     window::ScreenDimensions,
+    winit,
 };
 use serde::{Deserialize, Serialize};
 
 use tiled_support::{TileGid, TileMapPrefab, TiledFormat};
+
+#[derive(Default)]
+pub struct CurrentTileZ(pub u32, pub (f32, f32));
 
 #[derive(Eq, PartialOrd, PartialEq, Hash, Debug, Copy, Clone, Deserialize, Serialize)]
 enum AnimationId {
@@ -51,9 +65,13 @@ impl<'s> System<'s> for CameraMovementSystem {
         ReadStorage<'s, Camera>,
         WriteStorage<'s, Transform>,
         Read<'s, InputHandler<StringBindings>>,
+        Write<'s, CurrentTileZ>,
     );
 
-    fn run(&mut self, (active_camera, entities, cameras, mut transforms, input): Self::SystemData) {
+    fn run(
+        &mut self,
+        (active_camera, entities, cameras, mut transforms, input, mut current_tile_z): Self::SystemData,
+    ) {
         let x_move = input.axis_value("camera_x").unwrap();
         let y_move = input.axis_value("camera_y").unwrap();
         let z_move = input.axis_value("camera_z").unwrap();
@@ -97,6 +115,94 @@ struct Example {
     pub progress_counter: Option<ProgressCounter>,
 }
 
+#[derive(Default, Debug)]
+pub struct DrawRegionTileBounds;
+impl DrawTiles2DBounds for DrawRegionTileBounds {
+    fn bounds<T: Tile, E: CoordinateEncoder>(map: &TileMap<T, E>, world: &World) -> Region {
+        let camera_fetch =
+            amethyst::renderer::submodules::gather::CameraGatherer::gather_camera_entity(world);
+        assert!(camera_fetch.is_some());
+
+        let (entities, active_camera, screen_dimensions, transforms, cameras, current_tile_z) =
+            <(
+                Entities<'_>,
+                Read<'_, ActiveCamera>,
+                ReadExpect<'_, ScreenDimensions>,
+                ReadStorage<'_, Transform>,
+                ReadStorage<'_, Camera>,
+                Read<'_, CurrentTileZ>,
+            )>::fetch(world);
+
+        //let camera_tile_id = entity_tile_ids.get(camera_entity).u wrap();
+        let mut camera_join = (&cameras, &transforms).join();
+        if let Some((camera, camera_transform)) = active_camera
+            .entity
+            .and_then(|a| camera_join.get(a, &entities))
+            .or_else(|| camera_join.next())
+        {
+            let current_z = 5.0; // current_tile_z.0 as f32 * map.tile_dimensions().z as f32;
+
+            // Shoot a ray at each corner of the camera, and determine what tile it hits at the target
+            // Z-level
+            let proj = camera.projection();
+            let plane = Plane::with_z(current_z);
+
+            let ray = proj.screen_ray(
+                Point2::new(0.0, 0.0),
+                Vector2::new(screen_dimensions.width(), screen_dimensions.height()),
+                camera_transform,
+            );
+            let top_left = ray.at_distance(ray.intersect_plane(&plane).unwrap());
+
+            let ray = proj.screen_ray(
+                Point2::new(screen_dimensions.width(), screen_dimensions.height()),
+                Vector2::new(screen_dimensions.width(), screen_dimensions.height()),
+                camera_transform,
+            );
+            let bottom_right = ray.at_distance(ray.intersect_plane(&plane).unwrap()).coords
+                + Vector3::new(
+                    map.tile_dimensions().x as f32 * 5.0,
+                    -(map.tile_dimensions().y as f32 * 5.0),
+                    0.0,
+                );
+
+            let half_dimensions = Vector3::new(
+                (map.tile_dimensions().x * map.dimensions().x) as f32 / 2.0,
+                (map.tile_dimensions().x * map.dimensions().y) as f32 / 2.0,
+                (map.tile_dimensions().x * map.dimensions().z) as f32 / 2.0,
+            );
+            let bottom_right = Point3::new(
+                bottom_right
+                    .x
+                    .min(half_dimensions.x - map.tile_dimensions().x as f32)
+                    .max(-half_dimensions.x),
+                bottom_right
+                    .y
+                    .min(half_dimensions.y - map.tile_dimensions().y as f32)
+                    .max(-half_dimensions.y + map.tile_dimensions().y as f32),
+                bottom_right
+                    .z
+                    .min(half_dimensions.z - map.tile_dimensions().z as f32)
+                    .max(-half_dimensions.z),
+            );
+
+            let min = map
+                .to_tile(&top_left.coords, None)
+                .unwrap_or_else(|| Point3::new(0, 0, current_tile_z.0));
+
+            let max = map.to_tile(&bottom_right.coords, None).unwrap_or_else(|| {
+                Point3::new(
+                    map.dimensions().x - 1,
+                    map.dimensions().y - 1,
+                    current_tile_z.0,
+                )
+            });
+            Region::new(min, max)
+        } else {
+            Region::empty()
+        }
+    }
+}
 impl SimpleState for Example {
     fn on_start(&mut self, data: StateData<'_, GameData<'_, '_>>) {
         let world = data.world;
@@ -174,6 +280,23 @@ impl SimpleState for Example {
         }
         Trans::None
     }
+
+    fn handle_event(
+        &mut self,
+        data: StateData<'_, GameData<'_, '_>>,
+        event: StateEvent,
+    ) -> SimpleTrans {
+        let StateData { .. } = data;
+        if let StateEvent::Window(event) = &event {
+            if is_close_requested(&event) || is_key_down(&event, winit::VirtualKeyCode::Escape) {
+                Trans::Quit
+            } else {
+                Trans::None
+            }
+        } else {
+            Trans::None
+        }
+    }
 }
 
 fn main() -> amethyst::Result<()> {
@@ -209,7 +332,7 @@ fn main() -> amethyst::Result<()> {
         .with_bundle(
             RenderingBundle::<DefaultBackend>::new()
                 .with_plugin(
-                    RenderToWindow::from_config_path(display_config_path).with_clear([1.0; 4]),
+                    RenderToWindow::from_config_path(display_config_path)?.with_clear([1.0; 4]),
                 )
                 .with_plugin(RenderFlat2D::default())
                 .with_plugin(RenderTiles2D::<TileGid, FlatEncoder>::default()),
